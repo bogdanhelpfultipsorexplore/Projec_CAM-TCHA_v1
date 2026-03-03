@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cam-Tcha v1</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#f5f5f5; padding:24px; }
+    .box { max-width: 720px; margin:auto; background:#fff; border-radius:14px; padding:18px; box-shadow:0 8px 24px rgba(0,0,0,.08); }
+    h2 { margin: 6px 0 12px; }
+    .row { display:flex; gap:14px; flex-wrap:wrap; align-items:flex-start; }
+    video, canvas { border-radius:12px; background:#000; width: 320px; height: 240px; }
+    .panel { flex:1; min-width: 280px; }
+    button { padding:10px 14px; border-radius:10px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .status { margin-top:10px; font-weight:700; }
+    .red { color:#b00020; }
+    .green { color:#0b7a0b; }
+    .small { font-size: 13px; color:#555; margin-top:6px; line-height:1.35; }
+    .emojiBtns button { font-size:26px; margin:6px; }
+    #fallback { display:none; margin-top:14px; }
+    #unlocked { display:none; margin-top:14px; padding:12px; border-radius:12px; background:#f0fff0; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>Cam-Tcha v1</h2>
+    <div class="small">(Uses your camera to check you’re a real human. No images are uploaded — it runs in your browser.)</div>
+
+    <div class="row" style="margin-top:12px;">
+      <div>
+        <video id="vid" autoplay playsinline muted></video>
+        <canvas id="work" width="320" height="240" style="display:none;"></canvas>
+      </div>
+
+      <div class="panel">
+        <div><b>Step:</b> Turn on camera, then wave your hand for 1–2 seconds.</div>
+        <div class="small">Tip: Good lighting helps. If you don’t have a camera, use the fallback captcha below.</div>
+
+        <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
+          <button id="startBtn">Start camera</button>
+          <button id="stopBtn" disabled>Stop</button>
+        </div>
+
+        <div class="status" id="status">Ready.</div>
+        <div class="small" id="meter">Motion: 0</div>
+
+        <div id="unlocked">
+          <h3 style="margin:6px 0;">✅ Access Granted</h3>
+          <div>You passed Cam-Tcha v1.</div>
+        </div>
+
+        <div id="fallback">
+          <hr style="margin:14px 0;">
+          <div><b>Fallback (no camera):</b> click the matching emoji:</div>
+          <div id="target" style="font-size:42px; margin:10px 0;">✋</div>
+          <div class="emojiBtns" id="choices"></div>
+          <div class="small" id="cooldown"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  // ===== Camera liveness (motion detection) =====
+  const video = document.getElementById("vid");
+  const canvas = document.getElementById("work");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn = document.getElementById("stopBtn");
+  const statusEl = document.getElementById("status");
+  const meterEl = document.getElementById("meter");
+  const unlockedEl = document.getElementById("unlocked");
+  const fallbackEl = document.getElementById("fallback");
+
+  let stream = null;
+  let running = false;
+  let verified = false;
+
+  let prevFrame = null;
+  let motionScore = 0;
+
+  function setStatus(text, cls="status"){
+    statusEl.textContent = text;
+    statusEl.className = cls;
+  }
+
+  function showFallback(reason){
+    setStatus(reason, "status red");
+    fallbackEl.style.display = "block";
+    startEmojiFallback();
+  }
+
+  async function startCamera(){
+    if (verified) return;
+    try {
+      // Request camera. (Audio off)
+      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      video.srcObject = stream;
+      await video.play();
+
+      running = true;
+      prevFrame = null;
+      motionScore = 0;
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      setStatus("Camera on. Wave your hand…");
+
+      loop();
+    } catch (e) {
+      console.error(e);
+      showFallback("Camera blocked/unavailable. Using fallback captcha.");
+    }
+  }
+
+  function stopCamera(){
+    running = false;
+    if (stream){
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    video.srcObject = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    if (!verified) setStatus("Camera stopped.");
+  }
+
+  function computeMotion(curr, prev){
+    // Simple pixel-difference motion estimate
+    // Downsample by skipping pixels for speed.
+    let sum = 0;
+    const step = 16; // bigger = faster, less sensitive
+    for (let i = 0; i < curr.data.length; i += 4 * step) {
+      const dr = Math.abs(curr.data[i] - prev.data[i]);
+      const dg = Math.abs(curr.data[i+1] - prev.data[i+1]);
+      const db = Math.abs(curr.data[i+2] - prev.data[i+2]);
+      const d = dr + dg + db;
+      if (d > 60) sum++; // threshold per sampled pixel
+    }
+    return sum; // higher = more motion
+  }
+
+  function loop(){
+    if (!running || verified) return;
+
+    // Draw current video frame to hidden canvas
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const curr = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+    if (prevFrame){
+      const m = computeMotion(curr, prevFrame);
+
+      // Smooth motion score so it's less jumpy
+      motionScore = Math.round(motionScore * 0.7 + m * 0.3);
+      meterEl.textContent = "Motion: " + motionScore;
+
+      // If motion crosses threshold, pass
+      // (Tune this number if needed)
+      if (motionScore > 220) {
+        verified = true;
+        setStatus("✅ Human Verified.", "status green");
+        unlockedEl.style.display = "block";
+        stopCamera();
+        return;
+      }
+    }
+
+    prevFrame = curr;
+    requestAnimationFrame(loop);
+  }
+
+  startBtn.addEventListener("click", startCamera);
+  stopBtn.addEventListener("click", stopCamera);
+
+  // ===== Emoji fallback captcha =====
+  const emojis = ["✋","🤚","👌","✌️","👍","🤟"];
+  const targetEl = document.getElementById("target");
+  const choicesEl = document.getElementById("choices");
+  const cooldownEl = document.getElementById("cooldown");
+
+  let target = null;
+  let cooldownUntil = 0;
+
+  function randInt(n){ return Math.floor(Math.random()*n); }
+  function shuffle(arr){
+    const a = arr.slice();
+    for (let i=a.length-1;i>0;i--){
+      const j = randInt(i+1);
+      [a[i],a[j]]=[a[j],a[i]];
+    }
+    return a;
+  }
+
+  function startEmojiFallback(){
+    if (verified) return;
+    target = emojis[randInt(emojis.length)];
+    targetEl.textContent = target;
+    choicesEl.innerHTML = "";
+
+    shuffle(emojis).forEach(e => {
+      const b = document.createElement("button");
+      b.textContent = e;
+      b.disabled = Date.now() < cooldownUntil;
+      b.onclick = () => pickEmoji(e);
+      choicesEl.appendChild(b);
+    });
+
+    tickCooldown();
+  }
+
+  function pickEmoji(e){
+    if (verified) return;
+    if (Date.now() < cooldownUntil) return;
+
+    if (e === target){
+      verified = true;
+      setStatus("✅ Access Granted.", "status green");
+      unlockedEl.style.display = "block";
+      choicesEl.innerHTML = "";
+      cooldownEl.textContent = "";
+    } else {
+      cooldownUntil = Date.now() + 5000;
+      setStatus("X BOT DETECTED X", "status red");
+      tickCooldown();
+      setTimeout(startEmojiFallback, 600);
+    }
+  }
+
+  function tickCooldown(){
+    if (verified) return;
+    const left = Math.ceil((cooldownUntil - Date.now())/1000);
+    if (left > 0){
+      cooldownEl.textContent = `Wait... ${left}s`;
+      document.querySelectorAll("#choices button").forEach(b => b.disabled = true);
+      setTimeout(tickCooldown, 250);
+    } else {
+      cooldownEl.textContent = "";
+      document.querySelectorAll("#choices button").forEach(b => b.disabled = false);
+    }
+  }
+
+  // If browser doesn't support camera API, show fallback immediately
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showFallback("Camera not supported in this browser. Using fallback captcha.");
+  }
+</script>
+</body>
+</html>
